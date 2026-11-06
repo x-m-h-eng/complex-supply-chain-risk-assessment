@@ -3,8 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
+import streamlit_authenticator as stauth
 import networkx as nx
 
 from core.graph_engine import (
@@ -14,13 +14,42 @@ from core.graph_engine import (
 from core.text_agents import run_pipeline, node_exposure
 from core.explainer import build_context, explain, guard
 
-st.set_page_config(page_title="基于LLM的多智能体博弈归因的供应链风险全景测度系统", layout="wide")
+st.set_page_config(page_title="复杂供应链风险全景测度", page_icon="🕸️", layout="wide")
+# === 登录验证模块开始 ===
+credentials = st.secrets["credentials"].to_dict()
+cookie = st.secrets["cookie"]
+
+authenticator = stauth.Authenticate(
+    credentials,
+    cookie["name"],
+    cookie["key"],
+    cookie["expiry_days"],
+)
+
+authenticator.login()
+
+if st.session_state["authentication_status"]:
+    authenticator.logout(location="sidebar")
+    # 登录成功，下面的代码正常执行
+    pass 
+elif st.session_state["authentication_status"] is False:
+    st.error("❌ 用户名或密码错误")
+    st.info("💡 提示：如果登录失败或页面卡顿，请多刷新几次浏览器重试。")
+    st.stop()
+elif st.session_state["authentication_status"] is None:
+    st.warning("请先登录")
+    st.caption("若页面未能正常显示登录框，请刷新浏览器重试。")
+    st.stop()
+# === 登录验证模块结束 ===
 
 CFG = load_json("config/topology_13.json")
 EVENTS = load_json("config/events.json")
 PLAYERS = [n["id"] for n in CFG["nodes"]]
+NODE_MAP = {n["id"]: n for n in CFG["nodes"]}
 WINDOW_END = CFG["meta"]["window"][1]
 
+
+# ------------------------------------------------------------------ 计算（缓存）
 @st.cache_data(show_spinner=False)
 def compute_all(n_perm: int, seed: int):
     base = eval_state(CFG)
@@ -44,31 +73,24 @@ def compute_all(n_perm: int, seed: int):
     rows = []
     ranked = sorted(phi.items(), key=lambda x: -x[1])
     rank_map = {k: i + 1 for i, (k, _) in enumerate(ranked)}
-    
-    resp_threshold = np.quantile(list(phi.values()), 0.70) if phi else 0
-    exp_threshold = 0.15
 
     for n in CFG["nodes"]:
         nid = n["id"]
         exp = exposure.get(nid, 0.0)
         resp = phi.get(nid, 0.0)
-        
-        is_high_resp = (rank_map[nid] <= 4) or (resp >= resp_threshold)
-        is_high_exp = (exp >= exp_threshold)
-
-        if is_high_exp and is_high_resp:
+        if exp >= 0.5 and resp >= 0.5:
             quad = "显性核心"
-        elif not is_high_exp and is_high_resp:
+        elif exp < 0.5 and resp >= 0.5:
             quad = "隐性关键"
-        elif is_high_exp and not is_high_resp:
+        elif exp >= 0.5 and resp < 0.5:
             quad = "局部扰动"
         else:
             quad = "常规节点"
 
-        anchors = [r for r in results if r.get("node") == nid and not r.get("rejected")]
+        anchors = [r for r in results if r["node"] == nid and not r.get("rejected")]
         rows.append({
             "id": nid, "name": n["name"], "type": n["type"], "role": n["role"],
-            "capacity_source": n["capacity_source"], "capacity": n["capacity"],
+            "capacity_source": n["capacity_source"],
             "exposure": round(exp, 4),
             "responsibility": round(resp, 4),
             "rank": rank_map[nid],
@@ -77,11 +99,16 @@ def compute_all(n_perm: int, seed: int):
             "out_degree": G.out_degree(f"{nid}__out"),
             "is_cut_point": nid in cut_points,
             "is_bridge": nid in bridges,
+            "anchors": [a["evidence_anchor"] for a in anchors],
+            "rule_log": [lg for a in anchors for lg in a["rule_log"]],
             "critical": n.get("critical", False),
+            "demand_weight": CFG["demand_weight"],
+            "penalty": CFG["penalty"],
         })
 
     df = pd.DataFrame(rows).sort_values("responsibility", ascending=False).reset_index(drop=True)
     return df, results, method
+
 
 def get_api_key() -> str:
     try:
@@ -89,17 +116,23 @@ def get_api_key() -> str:
     except Exception:
         return os.environ.get("DEEPSEEK_API_KEY", "")
 
+
+# ------------------------------------------------------------------ 侧边栏
 with st.sidebar:
-    st.title("基于LLM的多智能体博弈归因的供应链风险全景测度系统")
+    st.title("🕸️ 复杂供应链风险全景测度")
     st.caption("暴露度 — 责任度 二维交叉决策矩阵")
     n_perm = st.slider("蒙特卡罗采样次数", 100, 2000, 500, 100)
     seed = st.number_input("随机种子", 1, 9999, 42)
     st.divider()
     api_key_input = st.text_input("DeepSeek API Key（可选，仅用于解释层）",
                                   type="password", value=get_api_key())
+    st.divider()
+    st.caption("数据边界：容量为公开锚点 / 相对比例 / 业务先验三级精度映射，"
+               "不代表企业内部绝对数据。")
 
 df, results, method = compute_all(int(n_perm), int(seed))
 
+# ------------------------------------------------------------------ 顶部指标
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("节点数", len(df))
 c2.metric("显性核心", int((df["quadrant"] == "显性核心").sum()))
@@ -107,50 +140,27 @@ c3.metric("隐性关键", int((df["quadrant"] == "隐性关键").sum()))
 c4.metric("归因方法", method.split("（")[0])
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["① 二维决策矩阵", "② 责任度归因", "③ 供应链网络拓扑", "④ 敏感性分析", "⑤ 智能体问答"]
+    ["① 二维决策矩阵", "② 责任度归因", "③ 文本测度与证据链", "④ 敏感性分析", "⑤ 智能体问答"]
 )
 
+# ------------------------------------------------------------------ ① 矩阵
 with tab1:
     st.subheader("暴露度 — 责任度 二维交叉矩阵")
-    
-    quad_color = {
-        "显性核心": "#d62728", "隐性关键": "#ff7f0e",
-        "局部扰动": "#1f77b4", "常规节点": "#7f7f7f",
-    }
-    
-    fig = go.Figure()
-    for quad in ["显性核心", "隐性关键", "局部扰动", "常规节点"]:
-        sub_df = df[df["quadrant"] == quad]
-        if sub_df.empty: continue
-        
-        fig.add_trace(go.Scatter(
-            x=sub_df["exposure"],
-            y=sub_df["responsibility"],
-            mode='markers+text',
-            name=quad,
-            text=sub_df["name"],
-            textposition='top center',
-            textfont=dict(size=14, color="black"),
-            hoverinfo='text',
-            hovertext=[
-                f"<b>{r['name']}</b><br>暴露度: {r['exposure']}<br>责任度: {r['responsibility']}<br>排名: {r['rank']}"
-                for _, r in sub_df.iterrows()
-            ],
-            marker=dict(size=20, color=quad_color[quad], line=dict(width=2, color='white'))
-        ))
-
-    fig.add_vline(x=0.15, line_dash="dash", line_color="gray")
-    y_thresh = df["responsibility"].quantile(0.70)
-    fig.add_hline(y=y_thresh, line_dash="dash", line_color="gray")
-    
-    fig.update_layout(
-        height=700, margin=dict(l=40, r=40, t=40, b=40), legend_title="象限",
-        plot_bgcolor="rgba(240,242,246,0.5)",
-        font=dict(size=14)
+    fig = px.scatter(
+        df, x="exposure", y="responsibility",
+        color="quadrant", text="name", size=[0.06] * len(df),
+        hover_data=["id", "role", "capacity_source", "rank"],
+        color_discrete_map={
+            "显性核心": "#d62728", "隐性关键": "#ff7f0e",
+            "局部扰动": "#1f77b4", "常规节点": "#7f7f7f",
+        },
+        labels={"exposure": "暴露度（文本测度）", "responsibility": "责任度（Shapley 归因）"},
+        range_x=[0, 1], range_y=[0, 1],
     )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='Lightgray', title="暴露度（文本测度）")
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='Lightgray', title="责任度（Shapley 归因）")
-    
+    fig.add_vline(x=0.5, line_dash="dash", line_color="gray")
+    fig.add_hline(y=0.5, line_dash="dash", line_color="gray")
+    fig.update_traces(textposition="top center", marker=dict(size=16))
+    fig.update_layout(height=560, legend_title="象限")
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("""
@@ -160,15 +170,19 @@ with tab1:
 - **常规节点**：常态巡检。
 """)
 
+# ------------------------------------------------------------------ ② 责任度
 with tab2:
     st.subheader("Shapley 责任度排序（Top-K）")
     top_k = st.slider("显示 Top-K", 3, len(df), min(10, len(df)))
     d = df.head(top_k).iloc[::-1]
     fig2 = px.bar(d, x="responsibility", y="name", orientation="h",
                   color="quadrant", text="responsibility",
-                  color_discrete_map=quad_color)
-    fig2.update_traces(texttemplate="%{text:.3f}", textposition="outside", textfont=dict(size=14))
-    fig2.update_layout(height=460, yaxis_title="", xaxis_title="归一化责任度", font=dict(size=14))
+                  color_discrete_map={
+                      "显性核心": "#d62728", "隐性关键": "#ff7f0e",
+                      "局部扰动": "#1f77b4", "常规节点": "#7f7f7f",
+                  })
+    fig2.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+    fig2.update_layout(height=460, yaxis_title="", xaxis_title="归一化责任度")
     st.plotly_chart(fig2, use_container_width=True)
 
     st.dataframe(
@@ -177,141 +191,54 @@ with tab2:
         use_container_width=True, hide_index=True,
     )
 
+# ------------------------------------------------------------------ ③ 文本测度
 with tab3:
-    st.subheader("供应链网络拓扑")
-    st.markdown("节点大小反映 **Shapley 责任度**。实线为单向物流，虚线为双向调拨边。")
+    st.subheader("多智能体文本测度：Extractor → Feedback → Revision")
+    rows = []
+    for r in results:
+        rows.append({
+            "事件": r["title"], "节点": NODE_MAP[r["node"]]["name"],
+            "日期": r["date"], "范围词": r["scope_word"],
+            "raw": r["severity_raw"],
+            "final": r["severity_final"] if not r.get("rejected") else "驳回",
+            "证据锚点": r["evidence_anchor"],
+            "规则日志": " | ".join(r["rule_log"]),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.info("R1 为硬门禁：证据锚点必须在原文逐字存在，否则直接驳回，不进入后续规则。"
+            "所有暴露度评分均可追溯至原文锚点与触发规则。")
 
-    pos = {
-        "N1": (0, 0.8), "N2": (0, 0.2),
-        "N3": (1, 0.7), "N4": (1, 0.3),
-        "N5": (2, 0.8), "N6": (2, 0.5), "N7": (2, 0.2),
-        "N8": (3, 0.7), "N9": (3, 0.5), "N10": (3, 0.2),
-        "N11": (4, 0.7), "N12": (4, 0.5), "N13": (4, 0.2),
-    }
-
-    node_dict = {n["id"]: n for n in CFG["nodes"]}
-    row_dict = {row["id"]: row for row in df.to_dict("records")}
-
-    role_info = {
-        "source": {"name": "供应源 (牧场)", "color": "#9b59b6"},     # 紫
-        "plant": {"name": "工厂 (核心/备份)", "color": "#e74c3c"},  # 红
-        "warehouse": {"name": "区域仓 (分仓)", "color": "#3498db"}, # 蓝
-        "delivery": {"name": "末端配送", "color": "#f1c40f"},       # 黄
-        "sink": {"name": "需求汇 (终端)", "color": "#2ecc71"}       # 绿
-    }
-
-    edge_traces = []
-    for edge in CFG["edges"]:
-        src, dst = edge["src"], edge["dst"]
-        if src not in pos or dst not in pos: continue
-        
-        x0, y0 = pos[src]
-        x1, y1 = pos[dst]
-        is_bidir = edge.get("bidirectional", False)
-        cap = edge["capacity"]
-        
-        line_width = max(2.0, min(6, cap / 150))
-        line_color = "rgba(150, 150, 150, 0.5)" if not is_bidir else "rgba(255, 165, 0, 0.6)"
-
-        edge_traces.append(go.Scatter(
-            x=[x0, x1], y=[y0, y1],
-            line=dict(width=line_width, color=line_color, dash='dot' if is_bidir else 'solid'),
-            hoverinfo='text',
-            text=f"{src} → {dst}<br>容量: {cap}<br>模式: {edge.get('mode', 'road')}",
-            mode='lines', showlegend=False
-        ))
-        
-        mid_x, mid_y = (x0 + x1) / 2, (y0 + y1) / 2
-        edge_traces.append(go.Scatter(
-            x=[mid_x], y=[mid_y], mode='markers',
-            marker=dict(symbol='triangle-right' if x1 >= x0 else 'triangle-left', size=14, color=line_color),
-            showlegend=False, hoverinfo='none'
-        ))
-
-    node_traces = {}
-    for nid, n in node_dict.items():
-        if nid not in pos: continue
-        role = n["type"]
-        if role not in node_traces: node_traces[role] = []
-        
-        x, y = pos[nid]
-        r_data = row_dict.get(nid, {})
-        quad = r_data.get("quadrant", "常规节点")
-        resp = r_data.get("responsibility", 0.0)
-        
-        size = 50 + (resp * 400)
-        
-        hover = f"<b>{n['name']} ({nid})</b><br>" \
-                f"职能: {n['role']}<br>" \
-                f"象限: {quad}<br>" \
-                f"责任度: {resp:.4f} (排名 {r_data.get('rank', '-')})<br>" \
-                f"暴露度: {r_data.get('exposure', 0.0):.4f}"
-        
-        node_traces[role].append(go.Scatter(
-            x=[x], y=[y], mode='markers+text',
-            name=role_info.get(role, {"name": "未知"})["name"],
-            text=[n["name"]],
-            textposition="bottom center",
-            textfont=dict(size=16, color="black"),
-            hoverinfo='text', hovertext=[hover],
-            marker=dict(size=size, color=role_info.get(role, {"color": "gray"})["color"], line=dict(width=2, color='white')),
-            showlegend=True
-        ))
-
-    fig_net = go.Figure()
-    for t in edge_traces: fig_net.add_trace(t)
-    for role, traces in node_traces.items():
-        for i, t in enumerate(traces):
-            t.showlegend = (i == 0)
-            fig_net.add_trace(t)
-
-    fig_net.update_layout(
-        height=750,
-        plot_bgcolor="white",
-        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-        margin=dict(l=40, r=40, t=40, b=40),
-        # 【修改】放大图例的字体和标题
-        legend=dict(
-            title=dict(text="节点角色", font=dict(size=18)),
-            font=dict(size=16)
-        )
-    )
-    st.plotly_chart(fig_net, use_container_width=True)
-
+# ------------------------------------------------------------------ ④ 敏感性
 with tab4:
     st.subheader("容量敏感性扫描（代理 / 先验节点 ±20%–30%）")
-    id_to_name = {n["id"]: n["name"] for n in CFG["nodes"]}
     if st.button("运行敏感性扫描", type="primary"):
         with st.spinner("扫描中…"):
             runs = sensitivity_scan(CFG, PLAYERS, n_perm=min(int(n_perm), 300), seed=int(seed))
         base = runs["baseline"]
         keys = sorted(base, key=lambda k: -base[k])[:8]
         mat = pd.DataFrame({k: [v[x] for x in keys] for k, v in runs.items()},
-                           index=[id_to_name.get(x, x) for x in keys])
+                           index=[NODE_MAP[x]["name"] for x in keys])
         st.dataframe(mat.round(4), use_container_width=True)
         st.line_chart(mat)
         st.caption("若核心节点排序在各扰动情形下不翻转，则责任度结论稳健。")
 
+# ------------------------------------------------------------------ ⑤ 智能体
 with tab5:
-    st.subheader("供应链风险智能问答")
-    st.markdown("""
-    **您可以尝试问以下问题：**
-    1. 台风导致 N5 停摆，N2 也设备老化，预算给谁？
-    2. N6 大面积关店是致命风险吗？
-    3. 今天北京天气怎么样，我想出去旅游？
-    """)
-    st.divider()
+    st.subheader("DeepSeek 业务翻译官（强约束 JSON Context）")
+    target = st.selectbox("选择要追问的节点",
+                          df["id"] + " " + df["name"], index=0)
+    tid = target.split(" ")[0]
+    row = df[df["id"] == tid].iloc[0].to_dict()
+    top_nodes = df.head(5)[["id", "name", "responsibility", "quadrant"]].to_dict("records")
+    ctx = build_context(row, top_nodes)
 
-    nodes_data = df[["id", "name", "role", "exposure", "responsibility", "rank", "quadrant"]].to_dict("records")
-    global_ctx = {
-        "all_nodes_metrics": nodes_data,
-    }
+    with st.expander("查看强约束 JSON Context（大模型唯一可见事实）"):
+        st.json(ctx)
 
     question = st.text_area(
-        "请输入您的供应链决策问题...",
-        placeholder="例如：N3 如果停产，对全局影响有多大？该不该优先投预算？",
-        height=100,
+        "管理者问题",
+        value=f"{row['name']}如果停产，对全局供应保障影响有多大？该不该优先投预算？",
+        height=90,
     )
     if st.button("生成解释与决策建议", type="primary"):
         ok, reason = guard(question)
@@ -319,9 +246,11 @@ with tab5:
             st.warning(f"越界拦截：{reason}")
         elif not api_key_input:
             st.error("请在侧边栏填写 DeepSeek API Key（或配置 secrets.toml）。")
-        elif not question.strip():
-            st.warning("请先输入您的问题。")
         else:
-            with st.spinner("智能体思考中..."):
-                ans = explain(api_key_input, global_ctx, question)
+            with st.spinner("解释层生成中…"):
+                ans = explain(api_key_input, ctx, question)
             st.markdown(ans)
+            st.caption("【可验证性】本回答的数值均来自后端图引擎，可追溯至 Shapley 值与原文证据锚点。")
+
+st.divider()
+st.caption("离线重加工 · 在线轻交互 | 后端不做 LLM 数值计算，LLM 不做后端数值计算")
